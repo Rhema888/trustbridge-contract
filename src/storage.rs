@@ -1207,7 +1207,7 @@ fn public_record_view(env: &Env, record: &ContributorRecord) -> ContributorRecor
         "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
     );
     ContributorRecord {
-        stellar_address: zero,
+        stellar_address: zero.clone(),
         payout_address: zero,
         ..record.clone()
     }

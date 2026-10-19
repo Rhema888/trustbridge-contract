@@ -509,6 +509,7 @@ impl fmt::Display for ContractError {
             ContractError::OracleProofNotAllowlisted => write!(f, "oracle proof not allowlisted"),
             ContractError::OracleProofExpired => write!(f, "oracle proof expired"),
             ContractError::OracleProofBadSignature => write!(f, "oracle proof bad signature"),
+            ContractError::AddressMismatch => write!(f, "address mismatch"),
         }
     }
 }
