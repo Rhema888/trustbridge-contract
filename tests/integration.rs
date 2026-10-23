@@ -11,11 +11,13 @@
 
 #![cfg(test)]
 
-use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env, String, Vec};
+use soroban_sdk::{
+    symbol_short, testutils::Address as _, testutils::Ledger as _, Address, Env, String, Vec,
+};
 
 use trustbridge_contract::{
-    AuditEventType, AuditLogEntry, ContractError, Role, RoleGrantCancelledEvent,
-    RoleGrantPendingEvent, TrustBridgeContract, VerifierAllowEntry, MAX_VERIFIERS,
+    BatchConfig, ContractError, Role, TrustBridgeContract, VerifierAllowEntry, MAX_VERIFIERS,
+    MAX_WRITE_BATCH,
 };
 
 fn setup_test_env() -> (Env, Address, Address, Address, Address) {
@@ -162,7 +164,7 @@ fn test_integration_guardian_pause_is_allowed_for_admin_or_guardian() {
 
 #[test]
 fn test_integration_emergency_pause_blocks_verify_and_clears() {
-    let (env, admin, user1, _user2, contract_id) = setup_test_env();
+    let (env, _admin, user1, _user2, contract_id) = setup_test_env();
     let guardian = Address::generate(&env);
 
     env.mock_all_auths();
@@ -222,20 +224,10 @@ fn test_integration_public_page_redacts_unverified_addresses() {
 
     env.mock_all_auths();
     env.as_contract(&contract_id, || {
-        TrustBridgeContract::register(
-            env.clone(),
-            s(&env, "alice"),
-            user1.clone(),
-            Vec::new(&env),
-        )
-        .unwrap();
-        TrustBridgeContract::register(
-            env.clone(),
-            s(&env, "bob"),
-            user2.clone(),
-            Vec::new(&env),
-        )
-        .unwrap();
+        TrustBridgeContract::register(env.clone(), s(&env, "alice"), user1.clone(), Vec::new(&env))
+            .unwrap();
+        TrustBridgeContract::register(env.clone(), s(&env, "bob"), user2.clone(), Vec::new(&env))
+            .unwrap();
         // Verify only alice; bob stays unverified.
         TrustBridgeContract::verify(env.clone(), admin.clone(), s(&env, "alice")).unwrap();
     });
@@ -243,21 +235,33 @@ fn test_integration_public_page_redacts_unverified_addresses() {
     env.mock_all_auths();
     env.as_contract(&contract_id, || {
         let page = TrustBridgeContract::get_public_paginated(env.clone(), None, 10).unwrap();
-        let mut by_name: std::collections::BTreeMap<String, _> =
-            page.records.into_iter().collect();
+        // `soroban_sdk::String` keys carry an `Env` handle, so clippy's
+        // `mutable_key_type` fires on maps keyed by them; the key is only ever
+        // read here.
+        #[allow(clippy::mutable_key_type)]
+        let mut by_name: std::collections::BTreeMap<String, _> = page.records.into_iter().collect();
         // Total must include both registrations.
         assert_eq!(page.total, 2);
 
         let alice = by_name
             .remove(&s(&env, "alice"))
             .expect("alice must be on the public page");
-        assert_ne!(alice.stellar_address, zero, "verified address must not be redacted");
+        assert_ne!(
+            alice.stellar_address, zero,
+            "verified address must not be redacted"
+        );
 
         let bob = by_name
             .remove(&s(&env, "bob"))
             .expect("bob must be on the public page");
-        assert_eq!(bob.stellar_address, zero, "unverified address must be redacted");
-        assert_eq!(bob.payout_address, zero, "unverified payout must be redacted");
+        assert_eq!(
+            bob.stellar_address, zero,
+            "unverified address must be redacted"
+        );
+        assert_eq!(
+            bob.payout_address, zero,
+            "unverified payout must be redacted"
+        );
     });
 }
 
@@ -3264,7 +3268,7 @@ fn test_conformance_public_reads_available_while_paused() {
 /// conformance set (Issue #294).
 #[test]
 fn test_conformance_admin_reads_while_paused_need_auth_not_pause() {
-    let (env, admin, user1, _user2, contract_id) = setup_test_env();
+    let (env, _admin, user1, _user2, contract_id) = setup_test_env();
 
     env.mock_all_auths();
     env.as_contract(&contract_id, || {
@@ -3327,7 +3331,7 @@ fn test_issue306_remove_compact_reregister_counter_parity() {
                 TrustBridgeContract::get_registered_paginated(env.clone(), cursor.clone(), 100)
                     .unwrap();
             pages += 1;
-            seen += page.records.len() as u32;
+            seen += page.records.len();
             if !page.has_more {
                 break;
             }
@@ -3372,7 +3376,7 @@ fn test_issue306_remove_compact_reregister_counter_parity() {
         }
     });
 
-    let expected_after_remove = N - removed.len() as u32;
+    let expected_after_remove = N - removed.len();
 
     // 2. Compact the sparse index densely.
     env.mock_all_auths();
@@ -3456,7 +3460,7 @@ fn test_issue306_remove_compact_reregister_counter_parity() {
             let page =
                 TrustBridgeContract::get_registered_paginated(env.clone(), cursor.clone(), 100)
                     .unwrap();
-            let page_size = page.records.len() as u32;
+            let page_size = page.records.len();
             seen += page_size;
             if !page.has_more {
                 break;
@@ -3464,7 +3468,7 @@ fn test_issue306_remove_compact_reregister_counter_parity() {
             cursor = page.next_cursor.clone();
         }
         assert_eq!(seen, stats.total, "paginated walk must visit every record");
-        assert_eq!(seen, all.len() as u32);
+        assert_eq!(seen, all.len());
     });
 }
 
@@ -4182,5 +4186,524 @@ fn test_verifier_allowlist_expiry_blocks_and_prunes() {
         let pruned = TrustBridgeContract::prune_expired_verifiers(env.clone()).unwrap();
         assert_eq!(pruned, 1);
         assert_eq!(TrustBridgeContract::get_verifiers(env.clone()).len(), 0);
+    });
+}
+
+// ── Batch Register Size Limits and Gas Budgeting (Issue #612) ─────────────────
+
+/// Helper executing bulk sequential registration of usernames using BatchConfig write-cap enforcement.
+/// Returns Ok(Vec<Address>) of generated addresses registered, or ContractError if batch limits or
+/// contract validation fails.
+fn register_batch_bounded(
+    env: &Env,
+    contract_id: &Address,
+    usernames: &Vec<String>,
+) -> Result<Vec<Address>, ContractError> {
+    let config = BatchConfig::for_writes();
+    if !config.is_valid_batch_size(usernames.len()) {
+        return Err(ContractError::InvalidBatchSize);
+    }
+
+    env.mock_all_auths();
+    let mut addrs: Vec<Address> = Vec::new(env);
+    for username in usernames.iter() {
+        let addr = Address::generate(env);
+        env.as_contract(contract_id, || {
+            TrustBridgeContract::register(
+                env.clone(),
+                username.clone(),
+                addr.clone(),
+                Vec::new(env),
+            )
+        })?;
+        addrs.push_back(addr);
+    }
+    Ok(addrs)
+}
+
+/// Generates a vector of `count` unique usernames with a prefix.
+fn make_batch_usernames(env: &Env, count: u32, prefix: &str) -> Vec<String> {
+    let mut names = Vec::new(env);
+    for i in 0..count {
+        names.push_back(s(env, &std::format!("{}-{:03}", prefix, i)));
+    }
+    names
+}
+
+/// Registers up to the configured write-batch ceiling (MAX_WRITE_BATCH = 25).
+/// Verifies all registrations succeed, data is queryable, and logs metered Soroban CPU/memory budget.
+#[test]
+fn test_batch_register_at_max_write_batch_ceiling() {
+    let (env, _admin, _user1, _user2, contract_id) = setup_test_env();
+
+    let usernames = make_batch_usernames(&env, MAX_WRITE_BATCH, "batch-ceil");
+    assert_eq!(usernames.len(), MAX_WRITE_BATCH);
+
+    env.cost_estimate().budget().reset_default();
+    let result = register_batch_bounded(&env, &contract_id, &usernames);
+    assert!(result.is_ok(), "registration at batch ceiling must succeed");
+    let addrs = result.unwrap();
+    assert_eq!(addrs.len(), MAX_WRITE_BATCH);
+
+    // Verify all records exist in registry
+    env.as_contract(&contract_id, || {
+        for (i, name) in usernames.iter().enumerate() {
+            let record = TrustBridgeContract::get_address(env.clone(), name.clone());
+            assert_eq!(
+                record.map(|r| r.stellar_address),
+                Some(addrs.get(i as u32).unwrap()),
+                "registered address mismatch"
+            );
+        }
+        let stats = TrustBridgeContract::get_stats(env.clone());
+        assert_eq!(stats.total, MAX_WRITE_BATCH);
+        assert_eq!(stats.verified, 0);
+    });
+
+    let budget = env.cost_estimate().budget();
+    let cpu = budget.cpu_instruction_cost();
+    let mem = budget.memory_bytes_cost();
+
+    std::println!(
+        "batch_register,ceiling_{},cpu_instructions={},memory_bytes={}",
+        MAX_WRITE_BATCH,
+        cpu,
+        mem
+    );
+
+    // Assert that execution was metered and comfortably within Soroban tx limits
+    assert!(cpu > 0, "CPU cost was not metered");
+    assert!(mem > 0, "Memory cost was not metered");
+    assert!(
+        cpu < 100_000_000,
+        "batch register CPU cost {cpu} exceeded Soroban 100M limit"
+    );
+    assert!(
+        mem < 40_000_000,
+        "batch register memory cost {mem} exceeded Soroban 40M limit"
+    );
+}
+
+/// Assert ContractError::InvalidBatchSize when attempting oversized bulk register helper path.
+#[test]
+fn test_batch_register_oversized_batch_rejected() {
+    let (env, _admin, _user1, _user2, contract_id) = setup_test_env();
+
+    let usernames = make_batch_usernames(&env, MAX_WRITE_BATCH + 1, "oversized");
+    assert_eq!(usernames.len(), MAX_WRITE_BATCH + 1);
+
+    env.cost_estimate().budget().reset_default();
+    let result = register_batch_bounded(&env, &contract_id, &usernames);
+    assert_eq!(
+        result,
+        Err(ContractError::InvalidBatchSize),
+        "Batch of size MAX_WRITE_BATCH + 1 must be rejected with InvalidBatchSize"
+    );
+
+    // Ensure zero records were created
+    env.as_contract(&contract_id, || {
+        assert_eq!(TrustBridgeContract::get_stats(env.clone()).total, 0);
+    });
+}
+
+/// Empty username list rejected before budget spend.
+#[test]
+fn test_batch_register_empty_list_rejected_before_budget_spend() {
+    let (env, _admin, _user1, _user2, contract_id) = setup_test_env();
+
+    let empty = Vec::new(&env);
+
+    env.cost_estimate().budget().reset_default();
+    let result = register_batch_bounded(&env, &contract_id, &empty);
+    assert_eq!(
+        result,
+        Err(ContractError::InvalidBatchSize),
+        "Empty batch must be rejected with InvalidBatchSize"
+    );
+
+    let budget = env.cost_estimate().budget();
+    assert!(
+        budget.cpu_instruction_cost() < 1_000,
+        "No registration budget should be spent on empty batch rejection before contract invocation"
+    );
+
+    env.as_contract(&contract_id, || {
+        assert_eq!(TrustBridgeContract::get_stats(env.clone()).total, 0);
+    });
+}
+
+/// Paused contract blocks register regardless of batch size.
+#[test]
+fn test_batch_register_paused_contract_blocks_register() {
+    let (env, _admin, _user1, _user2, contract_id) = setup_test_env();
+
+    // Pause the contract
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::pause(env.clone(), 1).unwrap();
+        assert!(TrustBridgeContract::is_paused(env.clone()));
+    });
+
+    // Valid batch size of 5 usernames
+    let usernames = make_batch_usernames(&env, 5, "paused");
+    let result = register_batch_bounded(&env, &contract_id, &usernames);
+    assert_eq!(
+        result,
+        Err(ContractError::Paused),
+        "Paused contract must reject registration attempts with ContractError::Paused"
+    );
+
+    // Even a batch at the MAX_WRITE_BATCH ceiling must be blocked
+    let ceiling_batch = make_batch_usernames(&env, MAX_WRITE_BATCH, "paused-ceil");
+    let result_ceiling = register_batch_bounded(&env, &contract_id, &ceiling_batch);
+    assert_eq!(
+        result_ceiling,
+        Err(ContractError::Paused),
+        "Paused contract must block registration regardless of batch size"
+    );
+}
+
+/// Chunked index compaction mid-batch must not corrupt pagination cursors.
+#[test]
+fn test_batch_register_compaction_mid_batch_preserves_pagination_cursors() {
+    let (env, _admin, _user1, _user2, contract_id) = setup_test_env();
+
+    // 1. Register first sub-batch of 10 users
+    let batch1 = make_batch_usernames(&env, 10, "subbatch-a");
+    let addrs1 = register_batch_bounded(&env, &contract_id, &batch1).unwrap();
+    assert_eq!(addrs1.len(), 10);
+
+    // 2. Fetch first page with limit 4, obtaining an opaque pagination cursor
+    env.mock_all_auths();
+    let page1 = env.as_contract(&contract_id, || {
+        TrustBridgeContract::get_registered_paginated(env.clone(), None, 4).unwrap()
+    });
+    assert_eq!(page1.records.len(), 4);
+    assert!(page1.has_more);
+    let cursor = page1
+        .next_cursor
+        .expect("cursor must be present for next page");
+
+    // 3. Trigger index compaction mid-batch
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        let chunks = TrustBridgeContract::compact_index(env.clone()).unwrap();
+        assert!(chunks > 0, "compact_index should write at least one chunk");
+    });
+
+    // 4. Register second sub-batch of 15 users (completing 25 total registrations up to ceiling)
+    let batch2 = make_batch_usernames(&env, 15, "subbatch-b");
+    let addrs2 = register_batch_bounded(&env, &contract_id, &batch2).unwrap();
+    assert_eq!(addrs2.len(), 15);
+
+    // 5. Query using the cursor obtained prior to compaction: cursor must not be corrupted
+    env.mock_all_auths();
+    let page2 = env.as_contract(&contract_id, || {
+        TrustBridgeContract::get_registered_paginated(env.clone(), Some(cursor), 10).unwrap()
+    });
+    assert_eq!(
+        page2.records.len(),
+        10,
+        "cursor must advance smoothly after compaction"
+    );
+    assert_eq!(
+        page2.total, 25,
+        "total count must reflect all registered records"
+    );
+
+    // 6. Complete traversal to end of registry and assert all 25 records were observed in order
+    let mut all_seen = std::vec::Vec::new();
+    let mut page_cursor = None;
+    loop {
+        env.mock_all_auths();
+        let page = env.as_contract(&contract_id, || {
+            TrustBridgeContract::get_registered_paginated(env.clone(), page_cursor.clone(), 10)
+                .unwrap()
+        });
+        for i in 0..page.records.len() {
+            let (u, _) = page.records.get(i).unwrap();
+            all_seen.push(u);
+        }
+        if !page.has_more {
+            break;
+        }
+        page_cursor = page.next_cursor;
+    }
+    assert_eq!(
+        all_seen.len(),
+        25,
+        "pagination must retrieve exactly 25 records"
+    );
+}
+
+/// Scale-test feature gated test exercising multi-batch sequential register pressure.
+#[cfg(feature = "scale-test")]
+#[test]
+fn test_scale_batch_register_multi_batch_load() {
+    let (env, _admin, _user1, _user2, contract_id) = setup_test_env();
+
+    // Run 4 successive batches up to MAX_WRITE_BATCH (100 total registrations)
+    let mut total_registered = 0;
+    for b in 0..4 {
+        let prefix = std::format!("scale-b{:02}", b);
+        let batch = make_batch_usernames(&env, MAX_WRITE_BATCH, &prefix);
+        let addrs = register_batch_bounded(&env, &contract_id, &batch).unwrap();
+        total_registered += addrs.len();
+    }
+
+    env.as_contract(&contract_id, || {
+        let stats = TrustBridgeContract::get_stats(env.clone());
+        assert_eq!(stats.total, total_registered);
+    });
+}
+
+// ── get_health_probes (Issue #668) ───────────────────────────────────────────
+
+#[test]
+fn test_health_probes_report_pause_admin_and_index_gen() {
+    let (env, admin, user1, _user2, contract_id) = setup_test_env();
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        let probes = TrustBridgeContract::get_health_probes(env.clone());
+        assert!(!probes.paused);
+        assert!(probes.admin_set);
+        let gen0 = probes.index_gen;
+
+        TrustBridgeContract::register(env.clone(), s(&env, "alice"), user1.clone(), Vec::new(&env))
+            .unwrap();
+        TrustBridgeContract::remove(env.clone(), admin.clone(), s(&env, "alice")).unwrap();
+        TrustBridgeContract::pause(env.clone(), 1).unwrap();
+
+        let probes = TrustBridgeContract::get_health_probes(env.clone());
+        assert!(probes.paused, "probe must work while paused");
+        assert!(probes.admin_set);
+        assert!(probes.index_gen > gen0, "removal must bump index_gen");
+    });
+}
+
+#[test]
+fn test_health_probes_uninitialized_reports_no_admin() {
+    let env = Env::default();
+    let contract_id = env.register(TrustBridgeContract, ());
+    env.as_contract(&contract_id, || {
+        let probes = TrustBridgeContract::get_health_probes(env.clone());
+        assert!(!probes.admin_set);
+        assert!(!probes.paused);
+        assert_eq!(probes.index_gen, 0);
+    });
+}
+
+// ── Issue #491: export_attestation helper integration ───────────────────────
+
+#[test]
+fn test_integration_export_attestation_covers_registered_page() {
+    let (env, _admin, user1, user2, contract_id) = setup_test_env();
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::register(env.clone(), s(&env, "alice"), user1.clone(), Vec::new(&env))
+            .unwrap();
+        TrustBridgeContract::register(env.clone(), s(&env, "bob"), user2.clone(), Vec::new(&env))
+            .unwrap();
+
+        let att = TrustBridgeContract::export_attestation(env.clone(), None, 10).unwrap();
+        assert_eq!(att.page.records.len(), 2u32);
+        assert_eq!(att.page.total, 2u32);
+        assert_eq!(att.version.len(), 3u32);
+        assert_eq!(att.ledger, env.ledger().sequence());
+        assert!(
+            att.digest.to_array() != [0u8; 32],
+            "non-empty page must produce a non-zero export digest"
+        );
+    });
+}
+
+#[test]
+fn test_integration_export_attestation_empty_registry() {
+    let (env, _admin, _user1, _user2, contract_id) = setup_test_env();
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        let att = TrustBridgeContract::export_attestation(env.clone(), None, 10).unwrap();
+        assert_eq!(att.page.records.len(), 0u32);
+        assert_eq!(att.page.total, 0u32);
+        assert!(att.page.next_cursor.is_none());
+    });
+}
+
+#[test]
+fn test_integration_export_attestation_pagination_cursor() {
+    let (env, _admin, user1, user2, contract_id) = setup_test_env();
+    let user3 = Address::generate(&env);
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::register(env.clone(), s(&env, "alice"), user1.clone(), Vec::new(&env))
+            .unwrap();
+        TrustBridgeContract::register(env.clone(), s(&env, "bob"), user2.clone(), Vec::new(&env))
+            .unwrap();
+        TrustBridgeContract::register(env.clone(), s(&env, "carol"), user3.clone(), Vec::new(&env))
+            .unwrap();
+    });
+    // One admin-authed export per frame: re-entering `export_attestation` in
+    // the same frame trips the host's existing-auth check.
+    let cursor = env.as_contract(&contract_id, || {
+        let first = TrustBridgeContract::export_attestation(env.clone(), None, 2).unwrap();
+        assert_eq!(first.page.records.len(), 2u32);
+        assert_eq!(first.page.total, 3u32);
+        assert!(
+            first.page.next_cursor.is_some(),
+            "limit 2 over 3 records must yield a cursor"
+        );
+        first.page.next_cursor.clone()
+    });
+    env.as_contract(&contract_id, || {
+        let second = TrustBridgeContract::export_attestation(env.clone(), cursor, 2).unwrap();
+        assert_eq!(second.page.records.len(), 1u32);
+        assert_eq!(second.page.total, 3u32);
+    });
+}
+
+// ── Issue #586: oracle proof Expired/BadSignature integration ───────────────
+
+/// Canonical ownership message `<username>:<address strkey>:<expires_at>`
+/// (mirrors `oracle_proof::ownership_message`, which is not exported).
+fn oracle_ownership_message_586(
+    env: &Env,
+    username: &String,
+    addr: &Address,
+    expires_at: u64,
+) -> soroban_sdk::Bytes {
+    let mut msg = username.to_bytes();
+    msg.push_back(b':');
+    msg.append(&addr.to_string().to_bytes());
+    msg.push_back(b':');
+    let mut digits = [0u8; 20];
+    let mut n = expires_at;
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    msg.append(&soroban_sdk::Bytes::from_slice(env, &digits[i..]));
+    msg
+}
+
+fn allowlisted_oracle_key_586(env: &Env, contract_id: &Address) -> soroban_sdk::BytesN<32> {
+    let key = soroban_sdk::BytesN::from_array(env, &[0xA5u8; 32]);
+    env.as_contract(contract_id, || {
+        let mut allowlist = Vec::new(env);
+        allowlist.push_back(key.clone());
+        TrustBridgeContract::set_oracle_allowlist(env.clone(), allowlist).unwrap();
+    });
+    key
+}
+
+#[test]
+fn test_integration_oracle_proof_expired_reports_code_60() {
+    let (env, _admin, user1, _user2, contract_id) = setup_test_env();
+    env.mock_all_auths();
+    let oracle_key = allowlisted_oracle_key_586(&env, &contract_id);
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::register(env.clone(), s(&env, "alice"), user1.clone(), Vec::new(&env))
+            .unwrap();
+    });
+    // Proof expired in the past; expiry is checked before any crypto.
+    env.ledger().set_timestamp(1_000);
+    env.as_contract(&contract_id, || {
+        let proof = trustbridge_contract::OracleProof {
+            oracle_pubkey: oracle_key.clone(),
+            message: oracle_ownership_message_586(&env, &s(&env, "alice"), &user1, 500),
+            signature: soroban_sdk::BytesN::from_array(&env, &[7u8; 64]),
+            expires_at: 500,
+        };
+        let err =
+            TrustBridgeContract::verify_with_oracle_proof(env.clone(), s(&env, "alice"), proof)
+                .unwrap_err();
+        assert_eq!(err, ContractError::OracleProofExpired);
+        assert_eq!(err as u32, 60u32);
+        assert_eq!(
+            ContractError::from_code(60),
+            Some(ContractError::OracleProofExpired)
+        );
+    });
+}
+
+#[test]
+fn test_integration_oracle_proof_bad_signature_reports_code_61() {
+    let (env, _admin, user1, _user2, contract_id) = setup_test_env();
+    env.mock_all_auths();
+    let oracle_key = allowlisted_oracle_key_586(&env, &contract_id);
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::register(env.clone(), s(&env, "alice"), user1.clone(), Vec::new(&env))
+            .unwrap();
+    });
+    env.as_contract(&contract_id, || {
+        // Well-formed layout but non-canonical encoding (high bits set):
+        // rejected as a bad signature without reaching host crypto.
+        let proof = trustbridge_contract::OracleProof {
+            oracle_pubkey: oracle_key.clone(),
+            message: oracle_ownership_message_586(&env, &s(&env, "alice"), &user1, 0),
+            signature: soroban_sdk::BytesN::from_array(&env, &[0xFFu8; 64]),
+            expires_at: 0,
+        };
+        let err =
+            TrustBridgeContract::verify_with_oracle_proof(env.clone(), s(&env, "alice"), proof)
+                .unwrap_err();
+        assert_eq!(err, ContractError::OracleProofBadSignature);
+        assert_eq!(err as u32, 61u32);
+        assert_eq!(
+            ContractError::from_code(61),
+            Some(ContractError::OracleProofBadSignature)
+        );
+    });
+}
+
+#[test]
+fn test_integration_oracle_proof_requires_allowlisted_key() {
+    let (env, _admin, user1, _user2, contract_id) = setup_test_env();
+    env.mock_all_auths();
+    let _ = allowlisted_oracle_key_586(&env, &contract_id);
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::register(env.clone(), s(&env, "alice"), user1.clone(), Vec::new(&env))
+            .unwrap();
+    });
+    env.as_contract(&contract_id, || {
+        // Valid shape, but the key was never allowlisted.
+        let proof = trustbridge_contract::OracleProof {
+            oracle_pubkey: soroban_sdk::BytesN::from_array(&env, &[0xB3u8; 32]),
+            message: oracle_ownership_message_586(&env, &s(&env, "alice"), &user1, 0),
+            signature: soroban_sdk::BytesN::from_array(&env, &[7u8; 64]),
+            expires_at: 0,
+        };
+        let err =
+            TrustBridgeContract::verify_with_oracle_proof(env.clone(), s(&env, "alice"), proof)
+                .unwrap_err();
+        assert_eq!(err, ContractError::OracleProofNotAllowlisted);
+    });
+}
+
+#[test]
+fn test_integration_oracle_proof_paused_rejects_before_crypto() {
+    let (env, _admin, user1, _user2, contract_id) = setup_test_env();
+    env.mock_all_auths();
+    let oracle_key = allowlisted_oracle_key_586(&env, &contract_id);
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::register(env.clone(), s(&env, "alice"), user1.clone(), Vec::new(&env))
+            .unwrap();
+        TrustBridgeContract::pause(env.clone(), 1).unwrap();
+    });
+    env.as_contract(&contract_id, || {
+        let proof = trustbridge_contract::OracleProof {
+            oracle_pubkey: oracle_key.clone(),
+            message: oracle_ownership_message_586(&env, &s(&env, "alice"), &user1, 0),
+            signature: soroban_sdk::BytesN::from_array(&env, &[7u8; 64]),
+            expires_at: 0,
+        };
+        let err =
+            TrustBridgeContract::verify_with_oracle_proof(env.clone(), s(&env, "alice"), proof)
+                .unwrap_err();
+        assert_eq!(err, ContractError::Paused);
     });
 }

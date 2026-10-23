@@ -157,15 +157,13 @@ fn parse_golden(golden: &str) -> Vec<Entrypoint> {
     let mut items = Vec::new();
     for chunk in array.split('{') {
         let name = json_string_field(chunk, "name");
-        let arity = chunk
-            .find("\"arity\"")
-            .and_then(|i| {
-                chunk[i..]
-                    .split(':')
-                    .nth(1)
-                    .and_then(|s| s.trim().split(|c: char| !c.is_ascii_digit()).next())
-                    .and_then(|n| n.parse().ok())
-            });
+        let arity = chunk.find("\"arity\"").and_then(|i| {
+            chunk[i..]
+                .split(':')
+                .nth(1)
+                .and_then(|s| s.trim().split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|n| n.parse().ok())
+        });
         if let (Some(name), Some(arity)) = (name, arity) {
             items.push(Entrypoint { name, arity });
         }
@@ -188,7 +186,10 @@ fn current_abi_matches_golden_entrypoint_snapshot() {
 #[test]
 fn removed_entrypoint_is_detected() {
     let mut items = public_entrypoints_from_abi(ABI_JSON);
-    assert!(items.len() > 1, "fixture ABI must list more than one function");
+    assert!(
+        items.len() > 1,
+        "fixture ABI must list more than one function"
+    );
     items.pop();
     assert_ne!(items, parse_golden(GOLDEN));
 }

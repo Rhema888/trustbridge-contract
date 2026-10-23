@@ -222,11 +222,11 @@ fn golden_codes_are_unique_and_ascending() {
     }
 }
 
-//! Display-string parity tests (Issue #625).
-//!
-//! The human-readable `Display` message for each variant must match the
-//! documented catalog in docs/ABI.md so operators decoding failed invocations
-//! see consistent wording.
+// Display-string parity tests (Issue #625).
+//
+// The human-readable `Display` message for each variant must match the
+// documented catalog in docs/ABI.md so operators decoding failed invocations
+// see consistent wording.
 
 #[test]
 fn display_strings_match_documented_catalog() {
@@ -238,11 +238,22 @@ fn display_strings_match_documented_catalog() {
         (ContractError::InvalidPauseReason, "invalid pause reason"),
         (ContractError::UsernameTaken, "username taken"),
         (ContractError::RoleExpired, "role expired"),
-        (ContractError::OracleProofBadSignature, "oracle proof bad signature"),
-        (ContractError::AlreadyInitialized, "contract already initialized"),
+        (
+            ContractError::OracleProofBadSignature,
+            "oracle proof bad signature",
+        ),
+        (
+            ContractError::AlreadyInitialized,
+            "contract already initialized",
+        ),
         (ContractError::VerifyRateLimited, "verify rate limited"),
+        (ContractError::AddressMismatch, "address mismatch"),
     ];
     for (error, expected) in cases {
-        assert_eq!(error.to_string(), *expected, "display string drifted for {error:?}");
+        assert_eq!(
+            error.to_string(),
+            *expected,
+            "display string drifted for {error:?}"
+        );
     }
 }

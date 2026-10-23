@@ -1,5 +1,5 @@
-use soroban_sdk::contracterror;
 use core::fmt;
+use soroban_sdk::contracterror;
 
 /// Errors returned by contract entry points.
 ///
@@ -488,11 +488,17 @@ impl fmt::Display for ContractError {
             ContractError::ProvenanceMissing => write!(f, "provenance missing"),
             ContractError::ProvenanceMismatch => write!(f, "provenance mismatch"),
             ContractError::StagedWasmMismatch => write!(f, "staged wasm mismatch"),
-            ContractError::UpgradeProposalAlreadyPending => write!(f, "upgrade proposal already pending"),
+            ContractError::UpgradeProposalAlreadyPending => {
+                write!(f, "upgrade proposal already pending")
+            }
             ContractError::NoUpgradeProposalPending => write!(f, "no upgrade proposal pending"),
-            ContractError::UpgradeProposalAlreadyApproved => write!(f, "upgrade proposal already approved"),
+            ContractError::UpgradeProposalAlreadyApproved => {
+                write!(f, "upgrade proposal already approved")
+            }
             ContractError::UpgradeProposalDelayActive => write!(f, "upgrade proposal delay active"),
-            ContractError::UpgradeProposalInsufficientApprovals => write!(f, "upgrade proposal insufficient approvals"),
+            ContractError::UpgradeProposalInsufficientApprovals => {
+                write!(f, "upgrade proposal insufficient approvals")
+            }
             ContractError::FallbackListFull => write!(f, "fallback list full"),
             ContractError::UsernameTaken => write!(f, "username taken"),
             ContractError::RotationRequired => write!(f, "rotation required"),

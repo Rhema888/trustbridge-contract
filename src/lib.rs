@@ -10,7 +10,7 @@ mod multisig_upgrade;
 mod oracle_proof;
 mod staged_wasm;
 mod storage;
-mod utils;
+pub mod utils;
 mod version;
 
 pub use audit::{AuditConfig, AuditEventType, AuditLogEntry, AuditStats};
@@ -63,10 +63,10 @@ pub use oracle_proof::{
 };
 pub use staged_wasm::StagedWasm;
 pub use storage::{
-    ChallengeRecord, ContributorRecord, ExportAttestation, ExportPage, HealthSnapshot, PauseReason,
-    PendingBatchRemove, PendingRoleGrant, PendingRotation, RecordProof, RepairReport, Role,
-    RoleHolder, Stats, VerificationConfig, VerifierAllowEntry, WasmAttestation, WasmProvenance,
-    MAX_FALLBACK_ADDRESSES, MAX_VERIFIERS,
+    ChallengeRecord, ContributorRecord, ExportAttestation, ExportPage, HealthProbes,
+    HealthSnapshot, PauseReason, PendingBatchRemove, PendingRoleGrant, PendingRotation,
+    RecordProof, RepairReport, Role, RoleHolder, Stats, VerificationConfig, VerifierAllowEntry,
+    WasmAttestation, WasmProvenance, MAX_FALLBACK_ADDRESSES, MAX_VERIFIERS,
 };
 pub use version::Version;
 
@@ -90,24 +90,22 @@ use crate::storage::{
     get_role_holder_count as storage_get_role_holder_count, get_role_holders_internal,
     get_rotation_delay as storage_get_rotation_delay, get_stats as read_stats,
     get_verification_config, get_verified_count as storage_get_verified_count,
-    get_verifier_allowlist, get_verify_limit,
-    get_version as storage_get_version, get_wasm_attestation, get_wasm_provenance, has_challenge,
-    has_pending_rotation, has_record, is_active_verifier as storage_is_active_verifier,
-    is_admin_caller, is_attestation_required, is_guardian, is_in_cooldown,
-    is_paused as storage_is_paused, prune_expired_verifiers, push_audit_entry, remove_challenge,
-    remove_from_index, remove_guardian as storage_remove_guardian, remove_pending_role,
-    remove_pending_rotation, remove_record, remove_role as storage_remove_role,
-    remove_verifier as storage_remove_verifier, remove_wasm_attestation,
-    require_initialized, require_not_paused,
-    require_role_not_expired, run_migration_steps, set_audit_config as storage_set_audit_config,
-    set_challenge, set_cooldown as storage_set_cooldown, set_count, set_emergency_pause,
-    set_emergency_pause_ts, set_ever_verified_count, set_guardian_address, set_last_action,
-    set_last_event_ledger, set_last_upgrade, set_network_id, set_paused as set_paused_state,
-    set_pending_reverify, set_pending_role, set_pending_rotation, set_record,
-    set_role as storage_set_role, set_role_delay as storage_set_role_delay,
-    set_rotation_delay as storage_set_rotation_delay, set_verified_count, set_verify_limit,
-    set_version, set_wasm_attestation,
-    set_wasm_provenance, verifier_allowlist_active, verifier_slots_remaining,
+    get_verifier_allowlist, get_verify_limit, get_version as storage_get_version,
+    get_wasm_attestation, get_wasm_provenance, has_challenge, has_pending_rotation, has_record,
+    is_active_verifier as storage_is_active_verifier, is_admin_caller, is_attestation_required,
+    is_guardian, is_in_cooldown, is_paused as storage_is_paused, prune_expired_verifiers,
+    push_audit_entry, remove_challenge, remove_from_index,
+    remove_guardian as storage_remove_guardian, remove_pending_role, remove_pending_rotation,
+    remove_record, remove_role as storage_remove_role, remove_verifier as storage_remove_verifier,
+    remove_wasm_attestation, require_initialized, require_not_paused, require_role_not_expired,
+    run_migration_steps, set_audit_config as storage_set_audit_config, set_challenge,
+    set_cooldown as storage_set_cooldown, set_count, set_emergency_pause, set_emergency_pause_ts,
+    set_ever_verified_count, set_guardian_address, set_last_action, set_last_event_ledger,
+    set_last_upgrade, set_network_id, set_paused as set_paused_state, set_pending_reverify,
+    set_pending_role, set_pending_rotation, set_record, set_role as storage_set_role,
+    set_role_delay as storage_set_role_delay, set_rotation_delay as storage_set_rotation_delay,
+    set_verified_count, set_verify_limit, set_version, set_wasm_attestation, set_wasm_provenance,
+    verifier_allowlist_active, verifier_slots_remaining,
     PendingRoleGrant as PendingRoleGrantRecord, ADMIN_KEY, DEFAULT_CHALLENGE_DELAY_SECS,
 };
 
@@ -1281,6 +1279,57 @@ impl TrustBridgeContract {
     #[must_use]
     pub fn get_attestation(env: Env) -> Option<WasmAttestation> {
         get_wasm_attestation(&env)
+    }
+
+    /// Enables or disables mandatory attestation before WASM upgrades (Issue #198).
+    ///
+    /// When `required` is `true`, every `upgrade` call must be preceded by a
+    /// valid, unexpired `attest_upgrade`; without it the upgrade fails with
+    /// [`ContractError::AttestationRequired`].  When `false` (the default),
+    /// attestation is optional — the two-step flow is advisory only.
+    ///
+    /// Note: `clear_attestation` removes the pending attestation record but does
+    /// **not** change this flag.  To disable the gate, call
+    /// `set_attestation_required(false)` explicitly.
+    ///
+    /// # Auth
+    ///
+    /// Requires auth from the contract admin.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::NotAuthorized`] if `caller` is not the admin.
+    pub fn set_attestation_required(
+        env: Env,
+        caller: Address,
+        required: bool,
+    ) -> Result<(), ContractError> {
+        require_initialized(&env)?;
+        caller.require_auth();
+
+        let admin = get_admin(&env)?;
+        if caller != admin {
+            Self::record_unauthorized_attempt(
+                &env,
+                &caller,
+                String::from_str(&env, "set_attestation_required"),
+            );
+            return Err(ContractError::NotAuthorized);
+        }
+
+        crate::storage::set_attestation_required(&env, required);
+        Ok(())
+    }
+
+    /// Returns whether WASM upgrade attestation is currently required.
+    ///
+    /// Defaults to `false` on instances that have never explicitly set the flag.
+    /// Dashboards and operator tooling can read this to show the current gate
+    /// configuration without needing admin credentials.
+    #[must_use]
+    pub fn get_attestation_required(env: Env) -> bool {
+        crate::storage::is_attestation_required(&env)
     }
 
     /// Returns the provenance of the currently deployed WASM.
@@ -3405,6 +3454,29 @@ impl TrustBridgeContract {
         get_public_paginated_internal(&env, cursor, limit)
     }
 
+    /// Returns a page of GitHub usernames flagged for re-verification after an
+    /// address change (Issue #587).
+    ///
+    /// Scans registry index entries `[offset, offset + limit)` and returns the
+    /// canonical usernames whose `PENDING_REVERIFY_KEY` flag is set. Gas is
+    /// bounded by `limit`, so a page can hold fewer than `limit` names; keep
+    /// advancing `offset` by `limit` until it reaches `get_stats().total`.
+    /// `limit == 0` uses `DEFAULT_PAGE_LIMIT`. An empty registry returns an
+    /// empty page. Read-only, no auth required.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotInitialized`] if `initialize` has not been called.
+    /// - [`ContractError::InvalidBatchSize`] if `limit > MAX_PAGE_LIMIT` (100).
+    pub fn get_pending_reverify(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<String>, ContractError> {
+        require_initialized(&env)?;
+        crate::storage::get_pending_reverify_page(&env, offset, limit)
+    }
+
     /// Toggles contract pause state. Admin-only (Issue #3).
     ///
     /// Operators use this as the read-only upgrade window switch: set
@@ -4295,11 +4367,7 @@ impl TrustBridgeContract {
         let cooldown_remaining_secs = if cooldown_secs > 0 {
             let last_upg = get_last_upgrade(&env);
             let next_allowed = last_upg.saturating_add(cooldown_secs);
-            if now < next_allowed {
-                next_allowed - now
-            } else {
-                0
-            }
+            next_allowed.saturating_sub(now)
         } else {
             0
         };
@@ -4318,6 +4386,21 @@ impl TrustBridgeContract {
             cooldown_remaining_secs,
             attestation_present,
         })
+    }
+
+    /// Returns the pre-Wave operator probes: pause flag, admin presence, and
+    /// index generation (Issue #668).
+    ///
+    /// Read-only, no auth required, works while paused, and — unlike
+    /// [`get_health`](Self::get_health) — never errors: an uninitialized
+    /// deployment reports `admin_set: false` so the probe fails closed with a
+    /// readable answer instead of `NotInitialized`.
+    pub fn get_health_probes(env: Env) -> HealthProbes {
+        HealthProbes {
+            paused: storage_is_paused(&env),
+            admin_set: crate::storage::has_admin(&env),
+            index_gen: crate::storage::get_index_generation(&env),
+        }
     }
 
     // ── Challenge-period flow (Issue #214) ───────────────────────────────────
@@ -8936,7 +9019,7 @@ mod test {
         env.mock_all_auths();
         env.cost_estimate().budget().reset_default();
         env.as_contract(&contract_id, || {
-            TrustBridgeContract::register(env.clone(), github_username, user, Vec::new(&env))
+            TrustBridgeContract::register(env.clone(), github_username, user, Vec::new(env))
                 .unwrap();
         });
 
@@ -11081,7 +11164,7 @@ mod test {
     #[test]
     fn test_set_paused_true_emits_paused_event() {
         let env = Env::default();
-        let (admin, _user, _other, contract_id) = setup(&env);
+        let (_admin, _user, _other, contract_id) = setup(&env);
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
             TrustBridgeContract::set_paused(env.clone(), true, 1).unwrap();
@@ -11100,7 +11183,7 @@ mod test {
     #[test]
     fn test_set_paused_false_emits_unpaused_event() {
         let env = Env::default();
-        let (admin, _user, _other, contract_id) = setup(&env);
+        let (_admin, _user, _other, contract_id) = setup(&env);
         env.mock_all_auths();
         env.as_contract(&contract_id, || {
             // First pause, then unpause via set_paused
@@ -11377,6 +11460,16 @@ mod test {
         let env = Env::default();
         let (_admin, _user, _other, contract_id) = setup(&env);
 
+        // Registering several chunks' worth of users in a single `Env` trips
+        // both the test budget and the mainnet invocation resource limits long
+        // before it trips anything the assertions below care about. The
+        // property under test — `has_record` / `get_address` resolving by
+        // direct persistent key rather than by scanning the chunked index — is
+        // independent of those harness limits, so both are lifted here (same
+        // rationale as `test_paginated_export_at_max_page_limit`).
+        env.cost_estimate().budget().reset_unlimited();
+        env.cost_estimate().disable_resource_limits();
+
         // Enough users to fill several chunks (CHUNK_SIZE == 50).
         const N: u32 = 260;
 
@@ -11458,7 +11551,7 @@ mod test {
     const FUZZ_SEED_CORPUS: &str = include_str!("../tests/fuzz/seeds.txt");
 
     fn parse_fuzz_seeds(text: &str) -> std::vec::Vec<u64> {
-        text.split(|c: char| c == '\n' || c == ',')
+        text.split(['\n', ','])
             .map(|l| l.split('#').next().unwrap_or("").trim())
             .filter(|l| !l.is_empty())
             .map(|l| {
@@ -11621,7 +11714,7 @@ mod test {
                             env.clone(),
                             username(env, name),
                             addr.clone(),
-                            Vec::new(&env),
+                            Vec::new(env),
                         )
                     });
                     if result.is_ok() {
@@ -12432,11 +12525,10 @@ mod test {
         });
         env.as_contract(&contract_id, || {
             assert!(TrustBridgeContract::get_staged(env.clone()).is_none());
-            assert!(
-                !env.storage()
-                    .instance()
-                    .has(&crate::staged_wasm::STAGED_WASM_KEY)
-            );
+            assert!(!env
+                .storage()
+                .instance()
+                .has(&crate::staged_wasm::STAGED_WASM_KEY));
         });
         assert_eq!(
             env.events().all(),
@@ -12461,11 +12553,10 @@ mod test {
             let result = TrustBridgeContract::clear_staged(env.clone(), user.clone());
             assert_eq!(result, Err(ContractError::NotAuthorized));
             assert!(TrustBridgeContract::get_staged(env.clone()).is_none());
-            assert!(
-                !env.storage()
-                    .instance()
-                    .has(&crate::staged_wasm::STAGED_WASM_KEY)
-            );
+            assert!(!env
+                .storage()
+                .instance()
+                .has(&crate::staged_wasm::STAGED_WASM_KEY));
             assert_eq!(env.events().all(), events_before);
         });
     }
@@ -12488,11 +12579,10 @@ mod test {
         env.as_contract(&contract_id, || {
             TrustBridgeContract::clear_staged(env.clone(), admin.clone()).unwrap();
             assert!(TrustBridgeContract::get_staged(env.clone()).is_none());
-            assert!(
-                !env.storage()
-                    .instance()
-                    .has(&crate::staged_wasm::STAGED_WASM_KEY)
-            );
+            assert!(!env
+                .storage()
+                .instance()
+                .has(&crate::staged_wasm::STAGED_WASM_KEY));
         });
     }
 

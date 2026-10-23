@@ -60,6 +60,9 @@ jobs:
       - name: Check event topics
         run: ./scripts/check_event_topics.sh
 
+      - name: Check subgraph event parity
+        run: make subgraph-parity
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -85,6 +88,22 @@ jobs:
 
       - name: Run oracle_proof module tests
         run: cargo test --lib oracle_proof
+
+  cross-contract-deny:
+    name: cross-contract register denial
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run cross-contract register denial tests
+        run: cargo test --test cross_contract_register_deny
 
   cargo-deny:
     name: cargo deny

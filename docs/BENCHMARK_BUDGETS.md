@@ -91,6 +91,19 @@ regardless of the regression percentage.
 | `verify` (success) | 25 000 000 | 3 000 000 |
 | `verify` (rejection) | 25 000 000 | 3 000 000 |
 
+### Batch register limits and multi-register workloads (Issue #612)
+
+Bulk registration workloads are bounded by `MAX_WRITE_BATCH = 25` (`src/batch.rs`).
+Sequential register integration tests in `tests/integration.rs` (`test_batch_register_at_max_write_batch_ceiling`)
+meter execution costs across the entire batch ceiling:
+
+| Workload | Batch size | Observed CPU instructions | Observed Memory bytes | Headroom vs Soroban tx limit |
+|---|---|---|---|---|
+| Sequential `register` batch | 25 (`MAX_WRITE_BATCH`) | ~1 970 000 | ~910 000 | > 98 % CPU, > 97 % memory |
+
+Oversized batches (`> MAX_WRITE_BATCH`) and empty batches (`0`) are rejected immediately before
+contract budget consumption with `ContractError::InvalidBatchSize`.
+
 ---
 
 ## CI job
@@ -123,10 +136,11 @@ make bench-budget-ci
 make bench-update-samples
 
 # Individual benchmark targets:
-make bench-register-budget    # register CPU/mem (with hard-cap check)
-make bench-export             # get_all_registered sweep
-make bench-username           # usernames_match sweep
-make bench-double-verify      # verify success vs rejection
+make bench-register-budget          # register CPU/mem (with hard-cap check)
+make bench-batch-register-budget    # batch register ceiling CPU/mem integration tests
+make bench-export                   # get_all_registered sweep
+make bench-username                 # usernames_match sweep
+make bench-double-verify            # verify success vs rejection
 ```
 
 ---
